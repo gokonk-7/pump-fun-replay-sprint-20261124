@@ -1,15 +1,27 @@
 """Fresh-coin sniper for make.fun's Pump.fun Replay Sprint (agent-fun/replay/v2).
 
-The house replay scorer streams one JSON line at a time over stdin: first a
-``hello`` describing the window (10 SOL of paper money, fees, caps, seed), then
-one ``batch`` per step carrying that step's pump.fun events (CreateEvent,
-TradeEvent, CompleteEvent, each stamped with its Solana ``slot``), the fills of
-the orders decided on the previous batch, and the account. The bot answers
-every batch with exactly one reply line carrying its ``orders`` for that batch,
-and stops when ``done`` arrives. stdout carries replies only; diagnostics go
-to stderr. No network, no clock, no files, no unseeded randomness: the same
-events always produce the same orders, so the two graded executions agree
-byte for byte.
+The house replay scorer streams one JSON line at a time over stdin, exactly as
+the kit's protocol.schema.json (agent-fun/replay/v2) and sdk/python/makefun_bot.py
+define it: first a ``hello`` (protocol, seed, universe, ``capital`` with
+``lamports``, ``caps`` with ``max_open_positions`` /
+``max_order_bps_of_real_reserve`` / ``max_orders_per_batch``, ``latency_slots``,
+``fees``), then one ``batch`` per slot carrying that slot's pump.fun events
+(``event`` is ``CreateEvent`` / ``TradeEvent`` / ``CompleteEvent``, each stamped
+with its Solana ``slot``), the ``marks`` (latest reserves for held mints), the
+``fills`` of the orders that resolved since the previous batch, and the
+``account`` (``cash_lamports`` and ``positions`` of ``token_amount`` /
+``cost_lamports``). The bot answers every batch with exactly one reply line
+carrying its ``orders`` for that batch -- a buy is ``{side, client_id, mint,
+quote_lamports, max_slippage_bps}``, a sell is ``{side, client_id, mint,
+token_amount, max_slippage_bps}``, u64 amounts as decimal strings, no other
+keys (the harness parses replies with a strict schema: an unknown key is a
+protocol violation that fails the run) -- and stops when ``done`` arrives.
+stdout carries replies only; diagnostics go to stderr. No network, no clock,
+no files, no unseeded randomness: the same events always produce the same
+orders, so the two graded executions agree byte for byte. Orders decided on
+the batch for slot s fill at slot s + latency_slots; the buys on one mint in
+one reply may together spend at most ``max_order_bps_of_real_reserve`` of its
+decision-time real SOL reserve, so each buy is sized to that cap.
 
 Strategy, in one paragraph: pump.fun is a coin factory -- thousands of coins
 are born every day, almost all of them die within minutes, and a handful run
@@ -79,7 +91,12 @@ HOLD_MAX_TRADES = 120            # time stop: exit after this many trades held
 FADE_WINDOW = 8                  # last N trades examined for a seller flip
 FADE_SELL_BPS = 7_000            # exit if >= 70% of that window's flow is sells
 DD_BRAKE_BPS = 2_500             # stop new entries once equity is 25% off its peak
-DEFAULT_SLIPPAGE_BPS = 100       # cap every order 1% past the price decided on
+DEFAULT_SLIPPAGE_BPS = 10_000   # cap every order 100% past the price decided on:
+                                # the kit's own pilot sniper ships buySlippageBps
+                                # 10_000, because with latency_slots 2 a fill
+                                # lands against reserves two slots later and the
+                                # tape routinely moves several percent in that
+                                # gap; a 1% cap would reject most fills outright
 
 
 def _as_int(value, default=0):
@@ -97,12 +114,17 @@ def _as_int(value, default=0):
 
 
 def _event_kind(event):
-    """'create', 'trade' or 'complete' for a pump.fun event, '' when unknown."""
-    raw = event.get("type")
+    """'create', 'trade' or 'complete' for a pump.fun event, '' when unknown.
+
+    The kit's events carry their kind in the ``event`` field
+    (``CreateEvent`` / ``TradeEvent`` / ``CompleteEvent``); the other keys
+    are fallbacks for nothing else.
+    """
+    raw = event.get("event")
+    if raw is None:
+        raw = event.get("type")
     if raw is None:
         raw = event.get("kind")
-    if raw is None:
-        raw = event.get("event")
     if raw is None:
         raw = event.get("name")
     if not isinstance(raw, str):
@@ -188,7 +210,7 @@ class Coin:
         "mint", "born_slot", "first_price", "last_price", "young_peak",
         "trades", "buyers", "buy_vol", "sell_vol", "completed",
         "entry_price", "entry_trade_no", "peak_since_entry",
-        "took_tp1", "exited",
+        "took_tp1", "exited", "real_sol",
     )
 
     def __init__(self, mint, slot, price):
@@ -207,6 +229,9 @@ class Coin:
         self.peak_since_entry = 0
         self.took_tp1 = False
         self.exited = False
+        #: Latest real SOL reserve (lamports) from the newest TradeEvent or
+        #: mark: the buy-size cap is a share of this at decision time.
+        self.real_sol = 0
 
     def note_trade(self, price, is_buy, sol_amount, user):
         """Fold one trade into the coin's tape (bounded memory)."""
@@ -234,22 +259,28 @@ class PumpState:
         self.hello = hello
         self.seq = -1
         self.slot = -1
+        # The kit's hello carries capital as {"lamports": "<u64 string>"} --
+        # there is no quote_units field; reading that key used to silently
+        # fall back to 10 SOL and, worse, the account below never updated.
         capital = hello.get("capital") or {}
-        self.cash = _as_int(capital.get("quote_units"), 10 * LAMPORTS_PER_SOL)
+        self.cash = _as_int(capital.get("lamports"), 10 * LAMPORTS_PER_SOL)
         self.equity = self.cash
         self.peak_equity = self.cash
         #: Held positions by mint: {"qty": int, "cost": int}.
         self.positions = {}
         #: Coins seen, by mint.
         self.coins = {}
-        self.warmup_bars = _as_int(hello.get("warmup_bars"), 0)
         fees = hello.get("fees") or {}
-        self.min_notional = _as_int(
-            fees.get("min_notional_quote_units"),
-            _as_int((hello.get("caps") or {}).get("min_notional_quote_units"), 0),
-        )
+        self.tx_fee_lamports = _as_int(
+            fees.get("base_fee_lamports"), 0
+        ) + _as_int(fees.get("priority_fee_lamports"), 0)
         caps = hello.get("caps") or {}
-        self.max_weight_bps = _as_int(caps.get("max_weight_bps"), BPS)
+        # The real caps come from hello: 5 open positions and a 1% of real
+        # reserves buy cap on this competition (see competition.yaml). The
+        # strategy's own MAX_OPEN is only the fallback when hello omits them.
+        self.max_order_bps = _as_int(
+            caps.get("max_order_bps_of_real_reserve"), BPS
+        )
         self.max_orders = _as_int(caps.get("max_orders_per_batch"), 20)
         self.max_open_positions = _as_int(
             caps.get("max_open_positions"), MAX_OPEN
@@ -260,35 +291,48 @@ class PumpState:
         #: Stops the bot buying the same mint twice while a fill is in flight
         #: (orders fill at the next batch's open, so the account lags a batch).
         self._pending_buys = {}
+        #: Every order sent and not yet reported back in a fill, by client_id
+        #: (the wire order): what _reserved_lamports counts against cash.
+        self._pending = {}
         # Rolling flow window per mint is kept small: last FLOW_WINDOW trades'
         # (is_buy, sol_amount) pairs, used for the entry gate and the fade exit.
         self._flow = {}
 
-    @property
-    def warming_up(self):
-        return self.warmup_bars > 0 and self.seq < self.warmup_bars
+    def _reserved_lamports(self):
+        """Lamports already committed to orders still in flight (buys plus
+        the tx fee every pending order pays): the account's cash does not
+        reflect them until their fills land, so entries must not spend them
+        twice."""
+        reserved = 0
+        for order in self._pending.values():
+            reserved += self.tx_fee_lamports
+            if order["side"] == "buy":
+                reserved += _as_int(order["quote_lamports"], 0)
+        return reserved
 
     def _set_account(self, account):
+        """Fold the batch's account in.
+
+        The kit's account is ``{"cash_lamports": "<u64>", "positions":
+        [{"mint", "token_amount", "cost_lamports"}]}`` -- there are no
+        ``cash_quote_units`` / ``equity_quote_units`` / ``qty`` fields, so
+        reading those left cash frozen at its opening value and every
+        position at qty 0 (no exit could ever fire). Equity is cash plus
+        the positions' value at their last seen prices.
+        """
         if not isinstance(account, dict):
             return
-        self.cash = _as_int(
-            account.get("cash_quote_units"), self.cash
-        )
-        self.equity = _as_int(
-            account.get("equity_quote_units"), self.equity
-        )
-        if self.equity > self.peak_equity:
-            self.peak_equity = self.equity
+        self.cash = _as_int(account.get("cash_lamports"), self.cash)
         positions = {}
         for entry in account.get("positions") or []:
             if not isinstance(entry, dict):
                 continue
-            mint = entry.get("mint") or entry.get("symbol") or ""
+            mint = entry.get("mint") or ""
             if not mint:
                 continue
             positions[mint] = {
-                "qty": _as_int(entry.get("qty"), 0),
-                "cost": _as_int(entry.get("cost_quote_units"), 0),
+                "qty": _as_int(entry.get("token_amount"), 0),
+                "cost": _as_int(entry.get("cost_lamports"), 0),
             }
         self.positions = positions
         for mint in list(self._pending_buys):
@@ -304,30 +348,50 @@ class PumpState:
                 coin.entry_trade_no = coin.trades
                 coin.peak_since_entry = coin.last_price
                 coin.took_tp1 = False
+        self.equity = self.cash
+        for mint, held in positions.items():
+            self.equity += self._value_lamports(mint, held["qty"])
+        if self.equity > self.peak_equity:
+            self.peak_equity = self.equity
 
     def _apply_fills(self, batch):
-        """Clear pending buys the batch's fills say were rejected."""
+        """Clear pending orders their fills resolve (filled, rejected or
+        failed alike -- the kit's SDK pops a pending order on any fill for
+        its client_id, harness closes included)."""
         fills = batch.get("fills")
         if not isinstance(fills, list):
             return
-        by_id = {cid: mint for mint, cid in self._pending_buys.items()}
         for fill in fills:
             if not isinstance(fill, dict):
                 continue
-            status = fill.get("status")
-            if not isinstance(status, str):
-                continue
-            if status.lower() not in ("rejected", "failed", "cancelled", "invalid"):
-                continue
             cid = fill.get("client_id")
-            mint = by_id.get(cid)
-            if mint:
-                del self._pending_buys[mint]
+            if not isinstance(cid, str):
+                continue
+            self._pending.pop(cid, None)
+            for mint, pending_cid in list(self._pending_buys.items()):
+                if pending_cid == cid:
+                    del self._pending_buys[mint]
+                    break
 
     def apply_batch(self, batch):
-        """Fold a batch in: its events, then the account."""
+        """Fold a batch in: its fills, then the account, then its marks and
+        events (the kit SDK's order: fills, account, marks, events -- the
+        account is already post-fill, so a position that just filled is
+        visible before its coin's tape is extended)."""
         self.seq = _as_int(batch.get("seq"), self.seq + 1)
         self.slot = _as_int(batch.get("slot"), self.slot)
+        self._apply_fills(batch)
+        self._set_account(batch.get("account"))
+        marks = batch.get("marks")
+        if isinstance(marks, list):
+            for mark in marks:
+                if not isinstance(mark, dict):
+                    continue
+                coin = self.coins.get(mark.get("mint") or "")
+                if coin is not None:
+                    coin.real_sol = _as_int(
+                        mark.get("real_quote_reserves"), coin.real_sol
+                    )
         events = batch.get("events")
         if events is None:
             events = batch.get("bars")
@@ -337,8 +401,6 @@ class PumpState:
             for event in events:
                 if isinstance(event, dict):
                     self._apply_event(event, self.slot)
-        self._apply_fills(batch)
-        self._set_account(batch.get("account"))
 
     def _apply_event(self, event, batch_slot):
         mint = _event_mint(event)
@@ -369,6 +431,13 @@ class PumpState:
             return
         is_buy = _event_is_buy(event)
         sol_amount = _as_int(event.get("sol_amount"), 0)
+        # The buy-size cap is a share of the real SOL reserve at decision
+        # time: TradeEvents carry it post-trade (real_sol_reserves, same
+        # value as real_quote_reserves on this SOL-quoted universe).
+        coin.real_sol = _as_int(
+            event.get("real_sol_reserves"),
+            _as_int(event.get("real_quote_reserves"), coin.real_sol),
+        )
         user = event.get("user")
         if not isinstance(user, str):
             user = event.get("trader")
@@ -454,11 +523,14 @@ class PumpState:
             return False
         if len(coin.buyers) < MIN_BUYERS:
             return False
-        if self.warming_up:
-            return False
         if self.equity * BPS < self.peak_equity * (BPS - DD_BRAKE_BPS):
             return False  # drawdown brake: manage exits only
-        if len(self.positions) >= self.max_open_positions:
+        # Committed slots count held positions plus buys still in flight
+        # (the kit SDK's committed_position_count): hello caps open
+        # positions at 5, and a buy decided while five are already
+        # committed would only come back rejected.
+        committed = len(self.positions) + len(self._pending_buys)
+        if committed >= self.max_open_positions:
             return False
         return True
 
@@ -508,6 +580,8 @@ class PumpState:
                 return None
             order["client_id"] = self._client_id()
             orders.append(order)
+            # Recorded as in flight until a fill reports back for it.
+            self._pending[order["client_id"]] = order
             return order
 
         # Exits first: every holding is checked against every exit rule.
@@ -531,10 +605,12 @@ class PumpState:
             else:
                 qty = held["qty"]
                 full = True
+            # Sell orders carry token_amount, not qty: the harness parses
+            # replies with a strict schema and an unknown key fails the run.
             sent = emit({
                 "side": "sell",
                 "mint": mint,
-                "qty": str(qty),
+                "token_amount": str(qty),
                 "max_slippage_bps": DEFAULT_SLIPPAGE_BPS,
             })
             if sent is None:
@@ -563,79 +639,121 @@ class PumpState:
             notional = BASE_NOTIONAL
             if score >= 1_000:
                 notional = BASE_NOTIONAL * 3 // 2  # strong tape: size up 1.5x
-            # Respect the per-mint weight cap and the cash on hand.
-            weight_room = (
-                self.max_weight_bps * self.equity // BPS
-                - self._value_lamports(mint, 0)
-            )
+            # Respect the per-mint size cap and the cash on hand. The
+            # harness rejects a buy that would take one reply's buys on a
+            # mint past max_order_bps_of_real_reserve of its decision-time
+            # real SOL reserve (1% here), so the spend is capped at that
+            # share of the latest real reserve; a coin with no real SOL
+            # behind it yet cannot be bought at all.
+            cap = coin.real_sol * self.max_order_bps // BPS
+            if cap <= 0:
+                continue
             spend = notional
             if spend > room:
                 spend = room
-            if spend > weight_room:
-                spend = weight_room
-            if spend > self.cash:
-                spend = self.cash
-            if spend < self.min_notional and self.min_notional > 0:
-                continue
+            if spend > cap:
+                spend = cap
+            available = self.cash - self._reserved_lamports()
+            if spend > available:
+                spend = available
             if spend < BASE_NOTIONAL // 2:
                 continue  # too small to survive fees: skip rather than dribble
+            # Buy orders carry quote_lamports, not notional_quote_units:
+            # the harness parses replies with a strict schema and an
+            # unknown key fails the run.
             sent = emit({
                 "side": "buy",
                 "mint": mint,
-                "notional_quote_units": str(spend),
+                "quote_lamports": str(spend),
                 "max_slippage_bps": DEFAULT_SLIPPAGE_BPS,
             })
             if sent is None:
                 break
             self._pending_buys[mint] = sent["client_id"]
             room -= spend
-            self.cash -= spend
             if room <= 0:
                 break
         return orders
 
 
+class ProtocolError(Exception):
+    """The harness sent something this shim cannot follow (wrong protocol,
+    malformed line, bad order of messages). Raised, like the kit SDK does:
+    the process then exits non-zero with the traceback on stderr, and
+    stdout -- replies only -- stays clean."""
+
+
 def _read_lines(src):
-    """Yield stdin's lines as UTF-8 text, one at a time."""
+    """Yield stdin's lines as UTF-8 text, one at a time.
+
+    Mirrors the kit SDK: a line over the limit or not valid UTF-8 is a
+    protocol error, not something to skip -- skipping would desync the
+    lockstep (the harness waits for a reply that never comes).
+    """
+    line_no = 0
     while True:
         raw = src.readline(MAX_HARNESS_LINE_BYTES + 1)
         if not raw:
             return
+        line_no += 1
         if raw.endswith(b"\n"):
             raw = raw[:-1]
+        elif len(raw) > MAX_HARNESS_LINE_BYTES:
+            raise ProtocolError(
+                "input line %d is over %d bytes" % (line_no, MAX_HARNESS_LINE_BYTES)
+            )
         if raw.endswith(b"\r"):
             raw = raw[:-1]
-        if not raw.strip():
-            continue
         try:
             yield raw.decode("utf-8")
         except UnicodeDecodeError:
-            continue
+            raise ProtocolError(
+                "input line %d is not valid UTF-8" % line_no
+            ) from None
 
 
 def run():
-    """Speak agent-fun/replay/v2 until done, then stop."""
+    """Speak agent-fun/replay/v2 until done, then stop.
+
+    Strict like the kit SDK: one hello first, one reply per batch echoing
+    its seq, nothing after done. A malformed line, an unknown message, a
+    batch before hello, a second hello, or EOF before done raises
+    ProtocolError instead of being silently skipped -- silently skipping
+    would break the lockstep and fail the run anyway, later and
+    opaquely.
+    """
     state = None
-    for line in _read_lines(sys.stdin.buffer):
+    batches = 0
+    for line_no, line in enumerate(_read_lines(sys.stdin.buffer), 1):
+        if not line.strip():
+            continue
         try:
             msg = json.loads(line)
         except ValueError:
-            continue
+            raise ProtocolError(
+                "input line %d is not JSON" % line_no
+            ) from None
         if not isinstance(msg, dict):
-            continue
+            raise ProtocolError(
+                "input line %d is not a JSON object" % line_no
+            )
         kind = msg.get("type")
         if kind == "hello":
             if state is not None:
-                continue
-            if msg.get("protocol") not in (PROTOCOL, None):
-                # A harness speaking another protocol: answer nothing rather
-                # than violate it; the run still ends cleanly at done/EOF.
-                state = PumpState(msg)
-                continue
+                raise ProtocolError(
+                    "input line %d: a second hello" % line_no
+                )
+            if msg.get("protocol") != PROTOCOL:
+                raise ProtocolError(
+                    "the harness speaks %r; this shim speaks %s"
+                    % (msg.get("protocol"), PROTOCOL)
+                )
             state = PumpState(msg)
         elif kind == "batch":
             if state is None:
-                continue
+                raise ProtocolError(
+                    "input line %d: a batch before hello" % line_no
+                )
             state.apply_batch(msg)
             orders = state.decide_orders()
             reply = json.dumps(
@@ -651,9 +769,22 @@ def run():
                 )
             sys.stdout.write(reply + "\n")
             sys.stdout.flush()
+            batches += 1
         elif kind == "done":
+            if state is None:
+                raise ProtocolError(
+                    "input line %d: done before hello" % line_no
+                )
             return
-    return
+        else:
+            raise ProtocolError(
+                "input line %d: unknown message type %r" % (line_no, kind)
+            )
+    if state is None:
+        raise ProtocolError("input ended before hello")
+    raise ProtocolError(
+        "input ended before done (after %d batches)" % batches
+    )
 
 
 def main():
